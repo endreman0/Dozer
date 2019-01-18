@@ -2,8 +2,11 @@
 
 import logging
 import re
+import socket
 import sys
 import traceback
+
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -45,7 +48,8 @@ class Dozer(commands.Bot):
     _global_cooldown = commands.Cooldown(1, 1, commands.BucketType.user)  # One command per second per user
 
     def __init__(self, config):
-        super().__init__(command_prefix=config['prefix'])
+        connector = aiohttp.TCPConnector(family=socket.AF_INET if config['ipv4_only'] else socket.AF_UNSPEC)
+        super().__init__(command_prefix=config['prefix'], connector=connector)
         self.config = config
         self._restarting = False
         self.check(self.global_checks)
