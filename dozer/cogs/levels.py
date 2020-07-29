@@ -1,5 +1,6 @@
 """Records members' XP and level."""
 import asyncio
+import math
 
 import asyncpg
 import discord
@@ -110,6 +111,40 @@ class Levels(Cog):
     rank.example_usage = """
     `{prefix}rank`: show your ranking
     `{prefix}rank coolgal#1234`: show another user's ranking
+    """
+
+    @staticmethod
+    def _fmt_member(guild, user_id):
+        member = guild.get_member(user_id)
+        if member:
+            return str(member)
+        else:
+            return "Missing member"
+
+    @command()
+    @guild_only()
+    async def levels(self, ctx):
+        """Show the XP leaderboard for this server."""
+
+        # Order by total_xp needs a tiebreaker, otherwise all records with equal XP have the same rank
+        # This causes rankings like #1, #1, #1, #4, #4, #6, ...
+        # user_id is arbitrary, chosen because it is guaranteed to be unique between two records in the same guild
+        records = await db.Pool.fetch(f"""
+            SELECT user_id, total_xp, rank() OVER (ORDER BY total_xp DESC, user_id) FROM {MemberXP.__tablename__}
+            WHERE guild_id = $1 ORDER BY total_xp DESC, user_id;
+        """, ctx.guild.id)
+
+        embeds = []
+        for page_num, page in enumerate(chunk(records, 10)):
+            embed = discord.Embed(title=f"Rankings for {ctx.guild}", color=discord.Color.blue())
+            embed.description = '\n'.join(f"#{rank}: {self._fmt_member(ctx.guild, user_id)} (lvl TODO, {total_xp} XP)"
+                                          for (user_id, total_xp, rank) in page)
+            embed.set_footer(text=f"Page {page_num+1} of {math.ceil(len(records) / 10)}")
+            embeds.append(embed)
+        await paginate(ctx, embeds)
+
+    levels.example_usage = """
+    `{prefix}levels`: show the XP leaderboard
     """
 
 
