@@ -1,10 +1,16 @@
 """Records members' XP and level."""
 import asyncio
+
+import asyncpg
 import discord
+import logging
 from discord.ext.commands import guild_only
-from .. import db
+from discord.ext.tasks import loop
+
 from ._utils import *
-from dozer.bot import DOZER_LOGGER
+from .. import db
+
+logger = logging.getLogger(__name__)
 
 
 class Levels(Cog):
@@ -13,21 +19,23 @@ class Levels(Cog):
     def __init__(self, bot):
         super().__init__(bot)
         self._loop = bot.loop
+        self._records_to_flush = []
 
-        self._to_flush = []  # list (queue) of records to flush to the database
-        self._last_flushed_at = self._loop.time()
-        # == Values to tune for perf ==
-        # If records haven't been flushed in the last N seconds, flush now
-        self._flush_timeout = 60
-        # If there are at least N records in queue, flush now
-        self._flush_cap = 100
+        self.flush_records.add_exception_type(asyncpg.PostgresError)
+        self.flush_records.start()
 
-    async def _flush_records(self):
+    @loop(minutes=1)
+    async def flush_records(self):
+        if not self._records_to_flush:
+            return  # nothing to do
+
+        logger.debug('writing %s record(s) to the database', len(self._records_to_flush))
+
         # Grab the queue of records to flush, replacing it with an empty queue for the next iteration
         # If an exception is raised later in this method, this intentionally causes the queue to be discarded. The
         # exception was probably caused by some record in the queue being invalid. By discarding it, we ensure that
         # future iterations aren't also affected.
-        records, self._to_flush = self._to_flush, []
+        records, self._records_to_flush = self._records_to_flush, []
 
         table = MemberXP.__tablename__
         stmt = f"""
@@ -39,44 +47,76 @@ class Levels(Cog):
         async with db.Pool.acquire() as conn:
             await conn.executemany(stmt, records)
 
+    _flush_records = flush_records.coro  # original function
+
+    @flush_records.before_loop
+    async def before_flush_loop(self):
+        await self.bot.wait_until_ready()
+
+    def cog_unload(self):
+        self.flush_records.cancel()
+
     @Cog.listener()
     async def on_message(self, message):
         if message.guild is None or message.author.bot:
             return
-        now = self._loop.time()
-        if len(self._to_flush) >= self._flush_cap or now > (self._last_flushed_at + self._flush_timeout):
-            try:
-                await self._flush_records()
-            except Exception as e:
-                DOZER_LOGGER.error("Error flushing XP data to database! %r", e)
-            else:
-                self._last_flushed_at = now
-        self._to_flush.append((message.guild.id, message.author.id, 20, message.created_at.timestamp()))
+        self._records_to_flush.append((message.guild.id, message.author.id, 20, message.created_at.timestamp()))
+
+    def _ensure_flush_running(self):
+        task = self.flush_records.get_task()
+        if task is None or not task.done():  # has not been started or has been started and not stopped
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.warning("Task flushing records was cancelled prematurely, restarting")
+        else:
+            # exc could be None if the task returns normally, but that would also be an error
+            logger.error("Task flushing records failed: %r", exc)
+        finally:
+            self.flush_records.start()
 
     @command()
     @guild_only()
     async def rank(self, ctx, member: discord.Member = None):
+        """Get a user's ranking on the XP leaderboard.
+        If no member is passed, the caller's ranking is shown.
+        """
         member = member or ctx.author
-        if self._to_flush:
-            self._last_flushed_at = self._loop.time()
-            await self._flush_records()
+        await self._flush_records()
 
-        records = await MemberXP.get_by(guild_id=ctx.guild.id, user_id=member.id)
-        if not records:
+        self._ensure_flush_running()
+
+        # Make Postgres compute the rank for us (need WITH-query so rank() sees records for every user)
+        record = await db.Pool.fetchrow(f"""
+            WITH ranked_xp AS (
+                SELECT user_id, total_xp, rank() OVER (ORDER BY total_xp DESC) FROM {MemberXP.__tablename__}
+                WHERE guild_id = $1
+            ) SELECT total_xp, rank FROM ranked_xp WHERE user_id = $2;
+        """, ctx.guild.id, member.id)
+
+        if record:
+            total_xp, rank = record
+        else:
             await ctx.send("That user isn't on the leaderboard.")
             return
-        record = records[0]
 
-        embed = discord.Embed(color=member.color, title=f"XP for {member.display_name}")
-        embed.description = (f"Level TODO, TODO/TODO XP to level up ({record.total_xp} total)\n"
-                             f"#TODO in this server")
+        embed = discord.Embed(color=member.color)
+        embed.description = (f"Level TODO, TODO/TODO XP to level up ({total_xp} total)\n"
+                             f"#{rank} in this server")
+        embed.set_author(name=member.display_name, icon_url=member.avatar_url_as(format='png', size=64))
         await ctx.send(embed=embed)
+
+    rank.example_usage = """
+    `{prefix}rank`: show your ranking
+    `{prefix}rank coolgal#1234`: show another user's ranking
+    """
 
 
 class MemberXP(db.DatabaseTable):
-    """Holds the roles of those who leave"""
+    """Database table mapping a guild and user to their XP and related values."""
     __tablename__ = 'levels_member_xp'
-    __uniques__ = 'guild__id, user_id'
+    __uniques__ = 'guild_id, user_id'
 
     @classmethod
     async def initial_create(cls):
